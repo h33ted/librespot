@@ -25,8 +25,8 @@ jobs:
     - name: Build
       run: |
         echo ${{ env.KEYMASTER_CLIENT_ID }} > src/client_id.txt
-        cargo build --target=x86_64-apple-darwin --release
-        cargo build --target=aarch64-apple-darwin --release
+        cargo build --target=x86_64-apple-darwin --release --no-default-features --features default-macos
+        cargo build --target=aarch64-apple-darwin --release --no-default-features --features default-macos
 
     - name: Build fat binary
       run: |

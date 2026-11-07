@@ -136,6 +136,7 @@ enum SpircCommand {
     Transfer(Option<TransferRequest>),
     Load(LoadRequest),
     AddToQueue(SpotifyUri),
+    ClearQueue,
 }
 
 const CONTEXT_FETCH_THRESHOLD: usize = 2;
@@ -395,22 +396,38 @@ impl Spirc {
         Ok(self.commands.send(SpircCommand::Load(command))?)
     }
 
-    /// Adds a track, episode, album or playlist to the queue.
+    /// Adds a track, episode, local file, album or playlist to the queue.
     ///
     /// Does nothing if we are not the active device.
     ///
     /// For albums and playlists, all tracks/episodes are resolved and added to the queue.
+    /// A local file plays when [`PlayerConfig::local_file_directories`] holds it, as it
+    /// does in a context.
+    ///
+    /// [`PlayerConfig::local_file_directories`]: librespot_playback::config::PlayerConfig::local_file_directories
     pub fn add_to_queue(&self, uri: SpotifyUri) -> Result<(), Error> {
         if !matches!(
             uri,
             SpotifyUri::Track { .. }
                 | SpotifyUri::Episode { .. }
+                | SpotifyUri::Local { .. }
                 | SpotifyUri::Album { .. }
                 | SpotifyUri::Playlist { .. }
         ) {
             return Err(Error::invalid_argument("uri"));
         }
         Ok(self.commands.send(SpircCommand::AddToQueue(uri))?)
+    }
+
+    /// Removes all queued tracks from the next tracks.
+    ///
+    /// Does nothing if we are not the active device.
+    ///
+    /// Only tracks added to the queue (via [Spirc::add_to_queue] or a connect client)
+    /// are removed. The current track, even if it was queued, and the tracks of the
+    /// context are kept; the next tracks are filled up from the context again.
+    pub fn clear_queue(&self) -> Result<(), Error> {
+        Ok(self.commands.send(SpircCommand::ClearQueue)?)
     }
 
     /// Disconnects the current device and pauses the playback according the value.
@@ -747,6 +764,10 @@ impl SpircTask {
             SpircCommand::SetVolume(volume) => self.set_volume(volume),
             SpircCommand::Load(command) => self.handle_load(command, None, None).await?,
             SpircCommand::AddToQueue(uri) => self.handle_add_to_queue(uri).await,
+            SpircCommand::ClearQueue => {
+                self.connect_state.clear_queue()?;
+                self.emit_set_queue_event();
+            }
         };
 
         self.notify().await
@@ -765,10 +786,10 @@ impl SpircTask {
             return Ok(());
         }
 
-        let is_current_track = matches! {
+        let is_current_track = matches!(
             (event.get_play_request_id(), self.play_request_id),
             (Some(event_id), Some(current_id)) if event_id == current_id
-        };
+        );
 
         // we only process events if the play_request_id matches. If it doesn't, it is
         // an event that belongs to a previous track and only arrives now due to a race
@@ -1623,7 +1644,9 @@ impl SpircTask {
 
     async fn handle_add_to_queue(&mut self, uri: SpotifyUri) {
         let track_uris: Vec<String> = match uri {
-            SpotifyUri::Track { .. } | SpotifyUri::Episode { .. } => vec![uri.to_uri()],
+            SpotifyUri::Track { .. } | SpotifyUri::Episode { .. } | SpotifyUri::Local { .. } => {
+                vec![uri.to_uri()]
+            }
             SpotifyUri::Album { .. } | SpotifyUri::Playlist { .. } => {
                 match self.session.spclient().get_context(&uri.to_uri()).await {
                     Ok(context) => context

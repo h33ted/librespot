@@ -37,7 +37,10 @@ edition = "2024"
 
 [features]
 default = ["native-tls", "spotty", "with-libmdns"]
-default-linux = ["rustls-tls-webpki-roots", "spotty", "with-libmdns"]
+# Linux: avahi is used when avahi-daemon is running (see spotty::default_zeroconf_backend), libmdns otherwise
+default-linux = ["rustls-tls-webpki-roots", "spotty", "with-libmdns", "with-avahi"]
+# macOS: dns-sd registers through the system's mDNSResponder instead of competing with it on port 5353
+default-macos = ["native-tls", "spotty", "with-libmdns", "with-dns-sd"]
 
 # TLS backends (mutually exclusive - compile-time checks in oauth/src/lib.rs)
 # Note: Feature validation is in oauth crate since it's compiled first in the dependency tree.
@@ -216,6 +219,7 @@ assets = [
 ]
 
 [workspace.lints]
+clippy.implicit_clone = "warn"
 clippy.redundant_closure_for_method_calls = "warn"
 
 [lints]

@@ -33,7 +33,7 @@ const NULLDEVICE: &str = "NUL";
 const NULLDEVICE: &str = "/dev/null";
 
 #[cfg(not(feature = "spotty"))]
-use librespot_oauth::OAuthClientBuilder;
+use librespot_oauth::{DeviceAuthClientBuilder, OAuthClientBuilder};
 use log::{debug, error, info, trace, warn};
 use sha1::{Digest, Sha1};
 use std::{
@@ -193,7 +193,6 @@ fn get_version_string() -> String {
 }
 
 /// Spotify's Desktop app uses these. Some of these are only available when requested with Spotify's client IDs.
-#[cfg(not(feature = "spotty"))]
 static OAUTH_SCOPES: &[&str] = &[
     //const OAUTH_SCOPES: Vec<&str> = vec![
     "app-remote-control",
@@ -237,6 +236,7 @@ struct Setup {
     credentials: Option<Credentials>,
     #[cfg(not(feature = "spotty"))]
     enable_oauth: bool,
+    enable_device_auth: bool,
     #[cfg(not(feature = "spotty"))]
     oauth_port: Option<u16>,
     zeroconf_port: u16,
@@ -251,6 +251,7 @@ struct Setup {
     single_track: Option<String>,
     start_position: u32,
     client_id: Option<String>,
+    device_auth_file: Option<String>,
     get_token: bool,
     save_token: Option<String>,
 }
@@ -281,6 +282,7 @@ async fn get_setup() -> Setup {
     const DISABLE_GAPLESS: &str = "disable-gapless";
     const DITHER: &str = "dither";
     const EMIT_SINK_EVENTS: &str = "emit-sink-events";
+    const ENABLE_DEVICE_AUTH: &str = "enable-device-auth";
     const ENABLE_OAUTH: &str = "enable-oauth";
     const ENABLE_VOLUME_NORMALISATION: &str = "enable-volume-normalisation";
     const FORMAT: &str = "format";
@@ -338,6 +340,7 @@ async fn get_setup() -> Setup {
     const HELP_SHORT: &str = "h";
     const ZEROCONF_INTERFACE_SHORT: &str = "i";
     const ENABLE_OAUTH_SHORT: &str = "j";
+    const ENABLE_DEVICE_AUTH_SHORT: &str = ""; // no short flag
     const OAUTH_PORT_SHORT: &str = "K";
     const ACCESS_TOKEN_SHORT: &str = "k";
     const CACHE_SIZE_LIMIT_SHORT: &str = "M";
@@ -428,6 +431,7 @@ async fn get_setup() -> Setup {
     const SAVE_TOKEN_SHORT: &str = "T";
     const CLIENT_ID: &str = "client-id";
     const SCOPE: &str = "scope";
+    const DEVICE_AUTH_FILE: &str = "device-auth-file";
 
     let mut opts = getopts::Options::new();
     opts.optflag(
@@ -484,6 +488,11 @@ async fn get_setup() -> Setup {
         ENABLE_OAUTH_SHORT,
         ENABLE_OAUTH,
         "Perform interactive OAuth sign in.",
+    )
+    .optflag(
+        ENABLE_DEVICE_AUTH_SHORT,
+        ENABLE_DEVICE_AUTH,
+        "Perform OAuth sign in by pairing a code at spotify.com/pair. Needs no browser on this machine.",
     )
     .optopt(
         NAME_SHORT,
@@ -787,6 +796,12 @@ async fn get_setup() -> Setup {
         PLAYER_MAC,
         "MAC address of the Squeezebox to be controlled",
         "MAC"
+    )
+    .optopt(
+        "",
+        DEVICE_AUTH_FILE,
+        "With --authenticate and --enable-device-auth: write the pairing code for spotify.com/pair to this JSON file instead of the console.",
+        "FILE"
     );
 
     let args: Vec<_> = std::env::args_os()
@@ -846,7 +861,7 @@ async fn get_setup() -> Setup {
             env_vars
                 .iter()
                 .find(|(k, _)| stripped_env_key(k) == opt)
-                .map(|(_, v)| v.to_string())
+                .map(|(_, v)| v.clone())
         }
     };
 
@@ -1284,6 +1299,14 @@ async fn get_setup() -> Setup {
     let enable_oauth = false;
     #[cfg(not(feature = "spotty"))]
     let enable_oauth = opt_present(ENABLE_OAUTH);
+    let enable_device_auth = opt_present(ENABLE_DEVICE_AUTH);
+
+    if enable_oauth && enable_device_auth {
+        error!(
+            "`--{ENABLE_OAUTH}` / `-{ENABLE_OAUTH_SHORT}` and `--{ENABLE_DEVICE_AUTH}` are mutually exclusive."
+        );
+        exit(1);
+    }
 
     let cache = {
         let volume_dir = opt_str(SYSTEM_CACHE)
@@ -1349,7 +1372,7 @@ async fn get_setup() -> Setup {
             }
         };
 
-        if enable_oauth && (cache.is_none() || cred_dir.is_none()) {
+        if (enable_oauth || enable_device_auth) && (cache.is_none() || cred_dir.is_none()) {
             warn!("Credential caching is unavailable, but advisable when using OAuth login.");
         }
 
@@ -1410,13 +1433,22 @@ async fn get_setup() -> Setup {
         None
     };
 
-    if credentials.is_none() && no_discovery_reason.is_some() && !enable_oauth {
+    if credentials.is_none()
+        && no_discovery_reason.is_some()
+        && !enable_oauth
+        && !enable_device_auth
+    {
         error!("Credentials are required if discovery and oauth login are disabled.");
         exit(1);
     }
 
     #[cfg(not(feature = "spotty"))]
     let oauth_port = if opt_present(OAUTH_PORT) {
+        if enable_device_auth {
+            warn!(
+                "With the `--{ENABLE_DEVICE_AUTH}` flag set `--{OAUTH_PORT}` / `-{OAUTH_PORT_SHORT}` has no effect."
+            );
+        }
         if !enable_oauth {
             warn!(
                 "Without the `--{ENABLE_OAUTH}` / `-{ENABLE_OAUTH_SHORT}` flag set `--{OAUTH_PORT}` / `-{OAUTH_PORT_SHORT}` has no effect."
@@ -1528,7 +1560,11 @@ async fn get_setup() -> Setup {
         }
     }
 
+    #[cfg(not(feature = "spotty"))]
     let zeroconf_backend_name = opt_str(ZEROCONF_BACKEND);
+    #[cfg(feature = "spotty")]
+    let zeroconf_backend_name =
+        opt_str(ZEROCONF_BACKEND).or_else(|| spotty::default_zeroconf_backend().map(String::from));
     let zeroconf_backend = no_discovery_reason.is_none().then(|| {
         librespot::discovery::find(zeroconf_backend_name.as_deref()).unwrap_or_else(|_| {
             let available_backends: Vec<_> = librespot::discovery::BACKENDS
@@ -1754,15 +1790,15 @@ async fn get_setup() -> Setup {
 
         let normalisation = opt_present(ENABLE_VOLUME_NORMALISATION);
 
-        let normalisation_method;
-        let normalisation_type;
-        let normalisation_pregain_db;
-        let normalisation_threshold_dbfs;
-        let normalisation_attack_cf;
-        let normalisation_release_cf;
-        let normalisation_knee_db;
-
-        if !normalisation {
+        let (
+            normalisation_method,
+            normalisation_type,
+            normalisation_pregain_db,
+            normalisation_threshold_dbfs,
+            normalisation_attack_cf,
+            normalisation_release_cf,
+            normalisation_knee_db,
+        ) = if !normalisation {
             for a in &[
                 NORMALISATION_METHOD,
                 NORMALISATION_GAIN_TYPE,
@@ -1780,175 +1816,177 @@ async fn get_setup() -> Setup {
                 }
             }
 
-            normalisation_method = player_default_config.normalisation_method;
-            normalisation_type = player_default_config.normalisation_type;
-            normalisation_pregain_db = player_default_config.normalisation_pregain_db;
-            normalisation_threshold_dbfs = player_default_config.normalisation_threshold_dbfs;
-            normalisation_attack_cf = player_default_config.normalisation_attack_cf;
-            normalisation_release_cf = player_default_config.normalisation_release_cf;
-            normalisation_knee_db = player_default_config.normalisation_knee_db;
+            (
+                player_default_config.normalisation_method,
+                player_default_config.normalisation_type,
+                player_default_config.normalisation_pregain_db,
+                player_default_config.normalisation_threshold_dbfs,
+                player_default_config.normalisation_attack_cf,
+                player_default_config.normalisation_release_cf,
+                player_default_config.normalisation_knee_db,
+            )
         } else {
-            normalisation_method = opt_str(NORMALISATION_METHOD)
-                .as_deref()
-                .map(|method| {
-                    NormalisationMethod::from_str(method).unwrap_or_else(|_| {
-                        invalid_error_msg(
-                            NORMALISATION_METHOD,
-                            NORMALISATION_METHOD_SHORT,
-                            method,
-                            "basic, dynamic",
-                            &format!("{:?}", player_default_config.normalisation_method),
-                        );
+            (
+                opt_str(NORMALISATION_METHOD)
+                    .as_deref()
+                    .map(|method| {
+                        NormalisationMethod::from_str(method).unwrap_or_else(|_| {
+                            invalid_error_msg(
+                                NORMALISATION_METHOD,
+                                NORMALISATION_METHOD_SHORT,
+                                method,
+                                "basic, dynamic",
+                                &format!("{:?}", player_default_config.normalisation_method),
+                            );
 
-                        exit(1);
+                            exit(1);
+                        })
                     })
-                })
-                .unwrap_or(player_default_config.normalisation_method);
+                    .unwrap_or(player_default_config.normalisation_method),
+                opt_str(NORMALISATION_GAIN_TYPE)
+                    .as_deref()
+                    .map(|gain_type| {
+                        NormalisationType::from_str(gain_type).unwrap_or_else(|_| {
+                            invalid_error_msg(
+                                NORMALISATION_GAIN_TYPE,
+                                NORMALISATION_GAIN_TYPE_SHORT,
+                                gain_type,
+                                "track, album, auto",
+                                &format!("{:?}", player_default_config.normalisation_type),
+                            );
 
-            normalisation_type = opt_str(NORMALISATION_GAIN_TYPE)
-                .as_deref()
-                .map(|gain_type| {
-                    NormalisationType::from_str(gain_type).unwrap_or_else(|_| {
-                        invalid_error_msg(
-                            NORMALISATION_GAIN_TYPE,
-                            NORMALISATION_GAIN_TYPE_SHORT,
-                            gain_type,
-                            "track, album, auto",
-                            &format!("{:?}", player_default_config.normalisation_type),
-                        );
-
-                        exit(1);
+                            exit(1);
+                        })
                     })
-                })
-                .unwrap_or(player_default_config.normalisation_type);
+                    .unwrap_or(player_default_config.normalisation_type),
+                opt_str(NORMALISATION_PREGAIN)
+                    .map(|pregain| match pregain.parse::<f64>() {
+                        Ok(value) if (VALID_NORMALISATION_PREGAIN_RANGE).contains(&value) => value,
+                        _ => {
+                            let valid_values = &format!(
+                                "{} - {}",
+                                VALID_NORMALISATION_PREGAIN_RANGE.start(),
+                                VALID_NORMALISATION_PREGAIN_RANGE.end()
+                            );
 
-            normalisation_pregain_db = opt_str(NORMALISATION_PREGAIN)
-                .map(|pregain| match pregain.parse::<f64>() {
-                    Ok(value) if (VALID_NORMALISATION_PREGAIN_RANGE).contains(&value) => value,
-                    _ => {
-                        let valid_values = &format!(
-                            "{} - {}",
-                            VALID_NORMALISATION_PREGAIN_RANGE.start(),
-                            VALID_NORMALISATION_PREGAIN_RANGE.end()
-                        );
+                            invalid_error_msg(
+                                NORMALISATION_PREGAIN,
+                                NORMALISATION_PREGAIN_SHORT,
+                                &pregain,
+                                valid_values,
+                                &player_default_config.normalisation_pregain_db.to_string(),
+                            );
 
-                        invalid_error_msg(
-                            NORMALISATION_PREGAIN,
-                            NORMALISATION_PREGAIN_SHORT,
-                            &pregain,
-                            valid_values,
-                            &player_default_config.normalisation_pregain_db.to_string(),
-                        );
+                            exit(1);
+                        }
+                    })
+                    .unwrap_or(player_default_config.normalisation_pregain_db),
+                opt_str(NORMALISATION_THRESHOLD)
+                    .map(|threshold| match threshold.parse::<f64>() {
+                        Ok(value) if (VALID_NORMALISATION_THRESHOLD_RANGE).contains(&value) => {
+                            value
+                        }
+                        _ => {
+                            let valid_values = &format!(
+                                "{} - {}",
+                                VALID_NORMALISATION_THRESHOLD_RANGE.start(),
+                                VALID_NORMALISATION_THRESHOLD_RANGE.end()
+                            );
 
-                        exit(1);
-                    }
-                })
-                .unwrap_or(player_default_config.normalisation_pregain_db);
+                            invalid_error_msg(
+                                NORMALISATION_THRESHOLD,
+                                NORMALISATION_THRESHOLD_SHORT,
+                                &threshold,
+                                valid_values,
+                                &player_default_config
+                                    .normalisation_threshold_dbfs
+                                    .to_string(),
+                            );
 
-            normalisation_threshold_dbfs = opt_str(NORMALISATION_THRESHOLD)
-                .map(|threshold| match threshold.parse::<f64>() {
-                    Ok(value) if (VALID_NORMALISATION_THRESHOLD_RANGE).contains(&value) => value,
-                    _ => {
-                        let valid_values = &format!(
-                            "{} - {}",
-                            VALID_NORMALISATION_THRESHOLD_RANGE.start(),
-                            VALID_NORMALISATION_THRESHOLD_RANGE.end()
-                        );
+                            exit(1);
+                        }
+                    })
+                    .unwrap_or(player_default_config.normalisation_threshold_dbfs),
+                opt_str(NORMALISATION_ATTACK)
+                    .map(|attack| match attack.parse::<u64>() {
+                        Ok(value) if (VALID_NORMALISATION_ATTACK_RANGE).contains(&value) => {
+                            duration_to_coefficient(Duration::from_millis(value))
+                        }
+                        _ => {
+                            let valid_values = &format!(
+                                "{} - {}",
+                                VALID_NORMALISATION_ATTACK_RANGE.start(),
+                                VALID_NORMALISATION_ATTACK_RANGE.end()
+                            );
 
-                        invalid_error_msg(
-                            NORMALISATION_THRESHOLD,
-                            NORMALISATION_THRESHOLD_SHORT,
-                            &threshold,
-                            valid_values,
-                            &player_default_config
-                                .normalisation_threshold_dbfs
-                                .to_string(),
-                        );
-
-                        exit(1);
-                    }
-                })
-                .unwrap_or(player_default_config.normalisation_threshold_dbfs);
-
-            normalisation_attack_cf = opt_str(NORMALISATION_ATTACK)
-                .map(|attack| match attack.parse::<u64>() {
-                    Ok(value) if (VALID_NORMALISATION_ATTACK_RANGE).contains(&value) => {
-                        duration_to_coefficient(Duration::from_millis(value))
-                    }
-                    _ => {
-                        let valid_values = &format!(
-                            "{} - {}",
-                            VALID_NORMALISATION_ATTACK_RANGE.start(),
-                            VALID_NORMALISATION_ATTACK_RANGE.end()
-                        );
-
-                        invalid_error_msg(
-                            NORMALISATION_ATTACK,
-                            NORMALISATION_ATTACK_SHORT,
-                            &attack,
-                            valid_values,
-                            &coefficient_to_duration(player_default_config.normalisation_attack_cf)
+                            invalid_error_msg(
+                                NORMALISATION_ATTACK,
+                                NORMALISATION_ATTACK_SHORT,
+                                &attack,
+                                valid_values,
+                                &coefficient_to_duration(
+                                    player_default_config.normalisation_attack_cf,
+                                )
                                 .as_millis()
                                 .to_string(),
-                        );
+                            );
 
-                        exit(1);
-                    }
-                })
-                .unwrap_or(player_default_config.normalisation_attack_cf);
+                            exit(1);
+                        }
+                    })
+                    .unwrap_or(player_default_config.normalisation_attack_cf),
+                opt_str(NORMALISATION_RELEASE)
+                    .map(|release| match release.parse::<u64>() {
+                        Ok(value) if (VALID_NORMALISATION_RELEASE_RANGE).contains(&value) => {
+                            duration_to_coefficient(Duration::from_millis(value))
+                        }
+                        _ => {
+                            let valid_values = &format!(
+                                "{} - {}",
+                                VALID_NORMALISATION_RELEASE_RANGE.start(),
+                                VALID_NORMALISATION_RELEASE_RANGE.end()
+                            );
 
-            normalisation_release_cf = opt_str(NORMALISATION_RELEASE)
-                .map(|release| match release.parse::<u64>() {
-                    Ok(value) if (VALID_NORMALISATION_RELEASE_RANGE).contains(&value) => {
-                        duration_to_coefficient(Duration::from_millis(value))
-                    }
-                    _ => {
-                        let valid_values = &format!(
-                            "{} - {}",
-                            VALID_NORMALISATION_RELEASE_RANGE.start(),
-                            VALID_NORMALISATION_RELEASE_RANGE.end()
-                        );
+                            invalid_error_msg(
+                                NORMALISATION_RELEASE,
+                                NORMALISATION_RELEASE_SHORT,
+                                &release,
+                                valid_values,
+                                &coefficient_to_duration(
+                                    player_default_config.normalisation_release_cf,
+                                )
+                                .as_millis()
+                                .to_string(),
+                            );
 
-                        invalid_error_msg(
-                            NORMALISATION_RELEASE,
-                            NORMALISATION_RELEASE_SHORT,
-                            &release,
-                            valid_values,
-                            &coefficient_to_duration(
-                                player_default_config.normalisation_release_cf,
-                            )
-                            .as_millis()
-                            .to_string(),
-                        );
+                            exit(1);
+                        }
+                    })
+                    .unwrap_or(player_default_config.normalisation_release_cf),
+                opt_str(NORMALISATION_KNEE)
+                    .map(|knee| match knee.parse::<f64>() {
+                        Ok(value) if (VALID_NORMALISATION_KNEE_RANGE).contains(&value) => value,
+                        _ => {
+                            let valid_values = &format!(
+                                "{} - {}",
+                                VALID_NORMALISATION_KNEE_RANGE.start(),
+                                VALID_NORMALISATION_KNEE_RANGE.end()
+                            );
 
-                        exit(1);
-                    }
-                })
-                .unwrap_or(player_default_config.normalisation_release_cf);
+                            invalid_error_msg(
+                                NORMALISATION_KNEE,
+                                NORMALISATION_KNEE_SHORT,
+                                &knee,
+                                valid_values,
+                                &player_default_config.normalisation_knee_db.to_string(),
+                            );
 
-            normalisation_knee_db = opt_str(NORMALISATION_KNEE)
-                .map(|knee| match knee.parse::<f64>() {
-                    Ok(value) if (VALID_NORMALISATION_KNEE_RANGE).contains(&value) => value,
-                    _ => {
-                        let valid_values = &format!(
-                            "{} - {}",
-                            VALID_NORMALISATION_KNEE_RANGE.start(),
-                            VALID_NORMALISATION_KNEE_RANGE.end()
-                        );
-
-                        invalid_error_msg(
-                            NORMALISATION_KNEE,
-                            NORMALISATION_KNEE_SHORT,
-                            &knee,
-                            valid_values,
-                            &player_default_config.normalisation_knee_db.to_string(),
-                        );
-
-                        exit(1);
-                    }
-                })
-                .unwrap_or(player_default_config.normalisation_knee_db);
-        }
+                            exit(1);
+                        }
+                    })
+                    .unwrap_or(player_default_config.normalisation_knee_db),
+            )
+        };
 
         #[cfg(feature = "spotty")]
         let ditherer = None;
@@ -2037,6 +2075,7 @@ async fn get_setup() -> Setup {
         credentials,
         #[cfg(not(feature = "spotty"))]
         enable_oauth,
+        enable_device_auth,
         #[cfg(not(feature = "spotty"))]
         oauth_port,
         zeroconf_port,
@@ -2050,6 +2089,7 @@ async fn get_setup() -> Setup {
         // Spotty
         authenticate,
         single_track: opt_str(SINGLE_TRACK),
+        device_auth_file: opt_str(DEVICE_AUTH_FILE),
         start_position: (start_position * 1000.0) as u32,
         get_token: opt_present(GET_TOKEN) || !save_token.as_str().is_empty(),
         save_token: if save_token.as_str().is_empty() {
@@ -2087,6 +2127,7 @@ async fn main() {
     const RUST_BACKTRACE: &str = "RUST_BACKTRACE";
     const RECONNECT_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(600);
     const DISCOVERY_RETRY_TIMEOUT: Duration = Duration::from_secs(10);
+    const DISCOVERY_RETRY_UPTIME_LIMIT: Duration = Duration::from_secs(60);
     const RECONNECT_RATE_LIMIT: usize = 5;
 
     if env::var(RUST_BACKTRACE).is_err() {
@@ -2115,8 +2156,8 @@ async fn main() {
         // network-online.target but it requires that a wait-online.service is
         // also enabled which is not always the case since a wait-online.service
         // can potentially hang the boot process until it times out in certain situations.
-        // This allows for discovery to retry every 10 secs in the 1st min of uptime
-        // before giving up thus papering over the issue and not holding up the boot process.
+        // This allows for discovery to do periodic retries for an amount of time after system
+        // startup before giving up thus papering over the issue and not holding up the boot process.
 
         discovery = loop {
             let device_id = setup.session_config.device_id.clone();
@@ -2135,11 +2176,14 @@ async fn main() {
                 Err(e) => {
                     sys.refresh_processes(ProcessesToUpdate::All, true);
 
-                    if System::uptime() <= 1 {
+                    if Duration::from_secs(System::uptime()) <= DISCOVERY_RETRY_UPTIME_LIMIT {
                         debug!("Retrying to initialise discovery: {e}");
                         tokio::time::sleep(DISCOVERY_RETRY_TIMEOUT).await;
                     } else {
-                        debug!("System uptime > 1 min, not retrying to initialise discovery");
+                        debug!(
+                            "System uptime > {} secs, not retrying to initialise discovery",
+                            DISCOVERY_RETRY_UPTIME_LIMIT.as_secs()
+                        );
                         warn!("Could not initialise discovery: {e}");
                         break None;
                     }
@@ -2148,10 +2192,21 @@ async fn main() {
         };
     }
 
+    // Spotty: the device code flow runs next to discovery, whichever the user completes first wins
+    let mut device_auth_rx: Option<tokio::sync::oneshot::Receiver<Option<Credentials>>> = None;
+
     #[cfg(feature = "spotty")]
     if let Some(credentials) = setup.credentials {
         last_credentials = Some(credentials);
         connecting = true;
+    } else if setup.authenticate && setup.enable_device_auth {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let client_id = setup.session_config.client_id.clone();
+        let code_file = setup.device_auth_file.clone();
+        tokio::spawn(async move {
+            let _ = tx.send(spotty::device_auth(client_id, code_file).await);
+        });
+        device_auth_rx = Some(rx);
     } else if discovery.is_none() {
         error!(
             "Discovery is unavailable and no credentials provided. Authentication is not possible."
@@ -2162,6 +2217,22 @@ async fn main() {
     #[cfg(not(feature = "spotty"))]
     if let Some(credentials) = setup.credentials {
         last_credentials = Some(credentials);
+        connecting = true;
+    } else if setup.enable_device_auth {
+        let client =
+            DeviceAuthClientBuilder::new(&setup.session_config.client_id, OAUTH_SCOPES.to_vec())
+                .build()
+                .unwrap_or_else(|e| {
+                    error!("Failed to create device auth client: {e}");
+                    exit(1);
+                });
+        // The async variant, because constructing a blocking reqwest client
+        // inside this tokio runtime would panic.
+        let oauth_token = client.get_access_token_async().await.unwrap_or_else(|e| {
+            error!("Failed to get Spotify access token: {e}");
+            exit(1);
+        });
+        last_credentials = Some(Credentials::with_access_token(oauth_token.access_token));
         connecting = true;
     } else if setup.enable_oauth {
         let port_str = match setup.oauth_port {
@@ -2272,6 +2343,26 @@ async fn main() {
                         error!("Discovery stopped unexpectedly");
                         exit(1);
                     }
+                }
+            },
+            credentials = async {
+                match device_auth_rx.as_mut() {
+                    Some(rx) => rx.await.ok().flatten(),
+                    None => None,
+                }
+            }, if device_auth_rx.is_some() => {
+                device_auth_rx = None;
+                match credentials {
+                    Some(credentials) if last_credentials.is_none() => {
+                        last_credentials = Some(credentials);
+                        connecting = true;
+                    },
+                    Some(_) => (),
+                    None if discovery.is_none() => {
+                        error!("Device authorization failed and discovery is unavailable.");
+                        exit(1);
+                    },
+                    None => warn!("Device authorization failed, waiting for discovery instead."),
                 }
             },
             // Spotty auth mode: exit after saving credentials
